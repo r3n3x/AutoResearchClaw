@@ -189,6 +189,7 @@ class AcpConfig:
     session_name: str = "researchclaw"
     timeout_sec: int = 1800
     max_turns: int = 1
+    model: str = ""
 
 
 @dataclass(frozen=True)

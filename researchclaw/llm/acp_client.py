@@ -43,6 +43,7 @@ class ACPConfig:
     session_name: str = "researchclaw"
     timeout_sec: int = 1800  # per-prompt timeout
     max_turns: int = 1  # turns allowed per prompt before acpx aborts the call
+    model: str = ""  # passed as --model to acpx (e.g. "opus")
 
 
 def _find_acpx() -> str | None:
@@ -93,6 +94,7 @@ class ACPClient:
             session_name=getattr(acp, "session_name", "researchclaw"),
             timeout_sec=getattr(acp, "timeout_sec", 1800),
             max_turns=getattr(acp, "max_turns", 1),
+            model=getattr(acp, "model", ""),
         ))
 
     # ------------------------------------------------------------------
@@ -476,8 +478,10 @@ class ACPClient:
         cmd = [
             acpx, "--approve-all", "--max-turns", str(self.config.max_turns),
             "--ttl", "0", "--cwd", self._abs_cwd(),
-            self.config.agent, "-s", self.config.session_name, prompt,
         ]
+        if self.config.model:
+            cmd += ["--model", self.config.model]
+        cmd += [self.config.agent, "-s", self.config.session_name, prompt]
         try:
             result = self._run_acp_with_heartbeat(cmd, label="ACP prompt (cli)")
         except subprocess.TimeoutExpired as exc:
@@ -496,8 +500,11 @@ class ACPClient:
         cmd = [
             acpx, "--approve-all", "--max-turns", str(self.config.max_turns),
             "--ttl", "0", "--cwd", self._abs_cwd(),
-            self.config.agent, "-s", self.config.session_name,
-            "-f", "-",
+        ]
+        if self.config.model:
+            cmd += ["--model", self.config.model]
+        cmd += [self.config.agent, "-s", self.config.session_name,
+                "-f", "-",
         ]
         try:
             result = self._run_acp_with_heartbeat(
