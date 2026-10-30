@@ -9,6 +9,7 @@ Produces three outputs consumed by the code generation stage:
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 from researchclaw.agents.base import AgentStepResult, BaseAgent
@@ -210,14 +211,30 @@ class AcquirerAgent(BaseAgent):
 
     @staticmethod
     def _strip_fences(code: str) -> str:
-        """Remove markdown code fences if present."""
+        """Remove markdown code fences and prose preambles if present."""
         code = code.strip()
-        if code.startswith("```"):
-            # Remove opening fence
-            first_nl = code.index("\n") if "\n" in code else len(code)
-            code = code[first_nl + 1:]
-        if code.endswith("```"):
-            code = code[:-3].rstrip()
+        # Prefer a fenced block when present (LLM often prefixes prose like
+        # "The user wants baseline instantiation code ..." before the code).
+        m = re.search(r"```(?:python)?\s*\n(.*?)```", code, re.DOTALL)
+        if m:
+            code = m.group(1).strip()
+        else:
+            if code.startswith("```"):
+                # Remove opening fence
+                first_nl = code.index("\n") if "\n" in code else len(code)
+                code = code[first_nl + 1:]
+            if code.endswith("```"):
+                code = code[:-3].rstrip()
+        # Drop a stray leading filename line (e.g. "main.py")
+        lines = code.splitlines()
+        while lines and re.match(r"^[A-Za-z0-9_][A-Za-z0-9_.-]*\.(?:py|txt|json|md)\s*$", lines[0]):
+            lines.pop(0)
+        code = "\n".join(lines).strip()
+        # Reject prose: real code contains imports or def/class definitions.
+        if code and not re.search(
+            r"^(?:import |from )\S|^(?:def |class |async def )", code, re.MULTILINE,
+        ):
+            return ""
         return code
 
     # -- Main entry point --------------------------------------------------

@@ -580,15 +580,44 @@ def _safe_json_loads(text: str, default: Any) -> Any:
     return default
 
 
+_STRAY_FILENAME_LINE = re.compile(
+    r"^[A-Za-z0-9_][A-Za-z0-9_.-]*\.(?:py|txt|json|md)\s*$",
+    re.MULTILINE,
+)
+
+
+def _is_plausible_code(code: str) -> bool:
+    """Reject prose/pseudocode masquerading as code.
+
+    Real runnable experiment code almost always contains at least one
+    import, function, or class definition.  Pseudocode plans ("producer
+    outputs (+logprob, entropy, features)") and conversational prose do
+    not.  Accepting them verbatim silently corrupts generated files.
+    """
+    stripped = code.strip()
+    if not stripped:
+        return False
+    return bool(
+        re.search(
+            r"^(?:import |from )\S|^(?:def |class |async def )",
+            stripped,
+            re.MULTILINE,
+        )
+    )
+
+
 def _extract_code_block(content: str) -> str:
     match = re.search(r"```(?:python)?\s*(.*?)\s*```", content, flags=re.DOTALL)
     if match is not None:
-        return match.group(1).strip()
+        code = _STRAY_FILENAME_LINE.sub("", match.group(1)).strip()
+        if code and _is_plausible_code(code):
+            return code
+        return ""
     # No fence found. Only trust the raw response as code if it actually
     # parses as Python — otherwise a conversational reply (e.g. "Same, no
     # change.") gets accepted verbatim and silently corrupts the file.
-    stripped = content.strip()
-    if not stripped:
+    stripped = _STRAY_FILENAME_LINE.sub("", content.strip())
+    if not stripped or not _is_plausible_code(stripped):
         return ""
     try:
         ast.parse(stripped)
@@ -663,7 +692,10 @@ def _extract_multi_file_blocks(content: str) -> dict[str, str]:
             # Normalise to flat filenames (strip leading ./ or subdirs for safety)
             fname = fname.replace("\\", "/").split("/")[-1]
             if fname and fname.endswith(".py"):
-                files[fname] = code.strip()
+                cleaned = _STRAY_FILENAME_LINE.sub("", code).strip()
+                if not cleaned or not _is_plausible_code(cleaned):
+                    continue
+                files[fname] = cleaned
         if files:
             # Ensure there is a main.py entry point
             if "main.py" not in files:
