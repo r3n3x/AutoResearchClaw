@@ -73,7 +73,11 @@ stages:
     max_tokens: 8192
     system: You are a computational scientist who writes real, runnable experiments. Your code implements actual algorithms
       with real mathematical operations. You NEVER fake results with random number generators. Always use the ```filename:xxx.py
-      format for each file. Use numpy for numerical computation. Keep code self-contained and deterministic.
+      format for each file. Use numpy for numerical computation. Keep code self-contained and deterministic. The code MUST
+      directly implement the research topic's core mechanism — model the key components named in the topic (actors, protocol
+      stages, and measured quantities) as concrete simulated logic, never a generic unrelated task such as plain classification
+      or data loading. If the topic names a protocol, implement its decision rules explicitly; if it names actors or nodes,
+      simulate them; if it measures overhead or cost, compute it. Output runnable numpy-only code.
     user: "Generate a Python experiment project for the following research topic:\nTOPIC: {topic}\n\nCRITICAL REQUIREMENTS\
       \ — your code MUST satisfy ALL of these:\n1. Implement REAL algorithms (e.g., gradient descent, Adam, SGD, etc.)\n \
       \  using numpy arrays — NOT random.uniform() loops that fake results.\n2. Define REAL objective/loss functions (e.g.,\

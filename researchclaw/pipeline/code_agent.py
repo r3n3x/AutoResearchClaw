@@ -249,6 +249,9 @@ class CodeAgent:
                 files = self._hard_validate_and_repair(
                     files, topic, exp_plan, metric, pkg_hint, arch_spec,
                 )
+                # Re-prove the surviving candidate actually runs — repairs
+                # may have swapped in different code than what exec-fix OK'd.
+                files = self._exec_fix_loop(files)
             best = SolutionNode(
                 node_id="single", files=files,
                 runs_ok=bool(files), score=1.0 if files else 0.0,
@@ -660,6 +663,40 @@ class CodeAgent:
 
     # ── Phase 2.5: Hard Validation Gates (E-03) ─────────────────────────
 
+    def _code_content_score(self, files: dict[str, str]) -> float:
+        """Score a file set by real implementation content.
+
+        Counts effective source lines (non-blank, non-comment, non-docstring,
+        non-import) across the .py files.  Stub/skeleton files (class headers
+        with `...` bodies, or a bare attribute) contribute almost nothing, so
+        the score is a reliable signal for preferring a full implementation over
+        a truncated fragment when selecting the best-known-good candidate.
+        """
+        import ast as _ast
+
+        total = 0.0
+        for fname, code in files.items():
+            if not fname.endswith(".py") or not code:
+                continue
+            try:
+                tree = _ast.parse(code)
+            except SyntaxError:
+                # Unparsable files are worthless as best-candidates.
+                continue
+            for node in _ast.walk(tree):
+                if isinstance(node, _ast.Expr):
+                    continue  # bare `...` bodies, bare expressions
+                if isinstance(node, (_ast.Import, _ast.ImportFrom)):
+                    continue
+                if isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef, _ast.ClassDef)):
+                    # Weight class/function definitions as real content.
+                    total += 4.0
+                    continue
+                if isinstance(node, (_ast.If, _ast.For, _ast.While, _ast.With, _ast.Try)):
+                    total += 0.5
+                    continue
+        return total
+
     def _hard_validate_and_repair(
         self,
         files: dict[str, str],
@@ -676,8 +713,32 @@ class CodeAgent:
         """
         self._log_event("Phase 2.5: Hard validation gates")
 
+        # Best-candidate tracking: keep the file set with the FEWEST criticals
+        # AND the MOST real content.  Counting criticals alone is wrong: a
+        # truncated stub (class skeleton with `...` bodies) has FEWER AST-
+        # critical issues than real, complete code, so naive "fewest criticals"
+        # tracking actively selects the stub over the good implementation.  We
+        # therefore score each candidate by real content (effective source
+        # lines) and prefer more content; critical-count is only a tiebreak.
+        best_files = dict(files)
+        best_critical: list[str] | None = None
+        best_quality: float = -1.0
+
         for attempt in range(self._cfg.hard_validation_max_repairs + 1):
             critical, warnings = self._hard_validate(files)
+
+            # Content-aware score: effective (non-blank/comment) lines minus a
+            # heavy penalty per critical issue.  A full implementation scores far
+            # higher than a stub, so the good candidate always wins the restore.
+            quality = self._code_content_score(files) - 100.0 * len(critical)
+            if files and (
+                best_critical is None
+                or quality > best_quality
+                or (quality == best_quality and len(critical) < len(best_critical))
+            ):
+                best_files = dict(files)
+                best_critical = list(critical)
+                best_quality = quality
 
             # Log warnings
             for w in warnings:
@@ -698,6 +759,21 @@ class CodeAgent:
                 self._log_event(f"  CRITICAL: {c}")
 
             if attempt >= self._cfg.hard_validation_max_repairs:
+                # Restore the best-known-good candidate when it is meaningfully
+                # better than the current (possibly stubbed) file set.  Prefer
+                # fewer criticals, but only when the best also carries real
+                # content — otherwise keep the fuller implementation.
+                cur_q = self._code_content_score(files) - 100.0 * len(critical)
+                best_q = self._code_content_score(best_files) - 100.0 * len(best_critical)
+                if best_critical is not None and best_q > cur_q:
+                    self._log_event(
+                        "  Max repair attempts reached — restoring best "
+                        f"candidate ({len(best_critical)} critical issue(s), "
+                        f"content={self._code_content_score(best_files):.0f}, "
+                        f"was {len(critical)} critical / "
+                        f"content={self._code_content_score(files):.0f})"
+                    )
+                    return best_files
                 self._log_event(
                     "  Max repair attempts reached — proceeding with warnings"
                 )
@@ -767,6 +843,45 @@ class CodeAgent:
                     critical.append(f"[{fname}] {w}")
                 else:
                     warnings.append(f"[{fname}] {w}")
+
+        # 3b. Stub detection — a class skeleton with `...` bodies, or a file
+        #     with only a class header and no real executable body, is not a
+        #     runnable experiment.  Stubs pass AST validation and can have few
+        #     criticals, which previously let the repair loop / best-candidate
+        #     tracking select a stub over the good implementation.  Flag them
+        #     CRITICAL so the pipeline keeps real code.
+        for fname, code in files.items():
+            if not fname.endswith(".py") or not code:
+                continue
+            try:
+                tree = ast.parse(code)
+            except SyntaxError:
+                continue  # already reported above
+            effective = 0
+            body_stubs = 0
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Expr):
+                    effective += 1
+                    if isinstance(node, ast.Constant) and node.value is Ellipsis:
+                        body_stubs += 1
+                elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    effective += 4
+                elif isinstance(node, (ast.If, ast.For, ast.While, ast.With, ast.Try, ast.Assign, ast.Call)):
+                    effective += 1
+                elif isinstance(node, (ast.Import, ast.ImportFrom)):
+                    effective += 0  # imports don't count
+            if body_stubs and effective <= body_stubs * 6:
+                critical.append(
+                    f"[{fname}] Stub implementation — class/function bodies are "
+                    f"placeholder `...` with no real logic ({effective} effective "
+                    f"nodes, {body_stubs} `...` bodies). Not runnable as an experiment."
+                )
+            elif effective < 20 and fname.endswith("main.py"):
+                critical.append(
+                    f"[{fname}] Too trivial to run — only {effective} effective "
+                    f"nodes; a real experiment needs a data path + algorithm "
+                    f"entry point."
+                )
 
         # 4. API correctness — NameError-causing issues are critical
         for fname, code in files.items():
