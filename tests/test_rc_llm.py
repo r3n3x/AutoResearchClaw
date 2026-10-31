@@ -592,7 +592,26 @@ def test_preflight_reports_rate_limit_through_retry_path(
 
 
 def test_retry_does_not_sleep_after_final_attempt(monkeypatch: pytest.MonkeyPatch):
-    """N attempts means N-1 backoff sleeps; the last one is pure waste."""
+    """N attempts means N-1 backoff sleeps; the last one is pure waste.
+
+    429 uses the shallow max_retries budget; 5xx uses the deeper
+    max_5xx_retries budget (survive proxy/provider 5xx storms).
+    """
+    delays = _record_sleeps(monkeypatch)
+    client = _retry_client(max_retries=3)
+    monkeypatch.setattr(
+        LLMClient,
+        "_raw_call",
+        lambda *a, **k: (_ for _ in ()).throw(_http_error(429)),
+    )
+
+    with pytest.raises(urllib.error.HTTPError):
+        client._call_with_retry("gpt-test", [], 10, 0.0, False)
+    assert len(delays) == 2
+
+
+def test_5xx_uses_deeper_retry_budget(monkeypatch: pytest.MonkeyPatch):
+    """Transient 5xx gets max_5xx_retries attempts, so max_retries-1 sleeps."""
     delays = _record_sleeps(monkeypatch)
     client = _retry_client(max_retries=3)
     monkeypatch.setattr(
@@ -603,7 +622,7 @@ def test_retry_does_not_sleep_after_final_attempt(monkeypatch: pytest.MonkeyPatc
 
     with pytest.raises(urllib.error.HTTPError):
         client._call_with_retry("gpt-test", [], 10, 0.0, False)
-    assert len(delays) == 2
+    assert len(delays) == client.config.max_5xx_retries - 1
 
 
 def test_retry_backoff_is_capped_for_os_errors(monkeypatch: pytest.MonkeyPatch):
