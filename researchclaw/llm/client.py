@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import time
 import urllib.error
 import urllib.request
@@ -138,6 +139,26 @@ class LLMClient:
 
         # Use preset base_url if available and config doesn't override
         base_url = rc_config.llm.base_url or preset_base_url or ""
+
+        # An empty key against a localhost/loopback endpoint must not leave
+        # ``config.api_key`` falsy: the stage executor treats a falsy key as
+        # "no LLM available" and SILENTLY falls back to a synthetic
+        # placeholder experiment (rerun 7 fake-"succeeded" this way when the
+        # run was launched from a tmux server whose env pre-dated the key in
+        # secrets.env). Local proxies typically ignore auth, so a placeholder
+        # keeps the client usable; remote endpoints keep the empty key so the
+        # existing missing-credential error paths still fire.
+        if not api_key and re.match(
+            r"^https?://(localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])([:/]|$)",
+            base_url,
+        ):
+            api_key = "local-no-auth"
+            logger.warning(
+                "LLM api_key_env %s resolved empty for loopback endpoint %s; "
+                "using placeholder key so local runs don't silently no-op.",
+                getattr(rc_config.llm, "api_key_env", ""),
+                base_url,
+            )
 
         # Preserve original URL/key before MetaClaw bridge override
         # (needed for Anthropic adapter which should always talk directly
