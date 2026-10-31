@@ -53,6 +53,19 @@ _DEFAULT_USER_AGENT = (
 _MAX_BACKOFF_SEC = 300  # 5-minute ceiling for retry delays
 
 
+def _read_key_file(path: str) -> str:
+    """Return the API key stored in *path* (stripped), or "" when unreadable.
+
+    Never logs the key itself; on failure only the path and error type.
+    """
+    try:
+        with open(os.path.expanduser(path), encoding="utf-8") as fh:
+            return fh.read().strip()
+    except OSError as exc:
+        logger.warning("API key file %s unreadable: %s", path, type(exc).__name__)
+        return ""
+
+
 @dataclass
 class LLMResponse:
     """Parsed response from the LLM API."""
@@ -259,6 +272,71 @@ class LLMClient:
 
             client._anthropic = AnthropicAdapter(
                 base_url, api_key, config.timeout_sec
+            )
+        return client
+
+    @classmethod
+    def codegen_from_rc_config(cls, rc_config: Any) -> "LLMClient | None":
+        """Build the stage-10 codegen client for ``llm.codegen_model``.
+
+        Returns None when ``codegen_model`` is empty or equals the primary
+        model (callers keep the main client). Without ``codegen_provider`` the
+        codegen model reuses the main provider/base_url/key and its fallback
+        chain. With ``codegen_provider`` it talks to an independent provider
+        (key from ``codegen_api_key_env`` or ``codegen_api_key_file``) with no
+        fallback models, since those belong to the main provider.
+        ``codegen_thinking``/``codegen_effort``/``codegen_refusal_fallback``
+        are sent by the Anthropic adapter only.
+        """
+        import dataclasses
+
+        from researchclaw.llm import PROVIDER_PRESETS
+
+        llm = rc_config.llm
+        codegen_model = str(getattr(llm, "codegen_model", "") or "").strip()
+        if not codegen_model or codegen_model == llm.primary_model:
+            return None
+
+        provider = str(getattr(llm, "codegen_provider", "") or "").strip()
+        if not provider:
+            return cls.from_rc_config(
+                dataclasses.replace(
+                    rc_config, llm=dataclasses.replace(llm, primary_model=codegen_model)
+                )
+            )
+
+        preset = PROVIDER_PRESETS.get(provider, {})
+        base_url = (
+            str(getattr(llm, "codegen_base_url", "") or "").strip()
+            or preset.get("base_url")
+            or ""
+        )
+        key_env = str(getattr(llm, "codegen_api_key_env", "") or "").strip()
+        key_file = str(getattr(llm, "codegen_api_key_file", "") or "").strip()
+        api_key = (os.environ.get(key_env, "") if key_env else "") or (
+            _read_key_file(key_file) if key_file else ""
+        )
+
+        config = LLMConfig(
+            base_url=base_url,
+            api_key=api_key,
+            wire_api=getattr(llm, "wire_api", "chat_completions"),
+            primary_model=codegen_model,
+            fallback_models=[],
+            timeout_sec=getattr(llm, "timeout_sec", 600),
+        )
+        client = cls(config)
+
+        if preset.get("adapter") == "anthropic":
+            from .anthropic_adapter import AnthropicAdapter
+
+            client._anthropic = AnthropicAdapter(
+                base_url,
+                api_key,
+                config.timeout_sec,
+                thinking=str(getattr(llm, "codegen_thinking", "") or "").strip(),
+                effort=str(getattr(llm, "codegen_effort", "") or "").strip(),
+                refusal_fallback=bool(getattr(llm, "codegen_refusal_fallback", False)),
             )
         return client
 

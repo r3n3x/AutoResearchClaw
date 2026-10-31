@@ -25,13 +25,30 @@ _STOP_REASON_MAP = {
     "max_tokens": "length",
     "stop_sequence": "stop",
     "tool_use": "tool_calls",
+    "refusal": "content_filter",
 }
+
+# Thinking counts toward max_tokens; with thinking on, a budget sized for the
+# reply alone (512-4096 in some codegen calls) can end before any text.
+_THINKING_MIN_MAX_TOKENS = 16000
+
+# Beta header for the server-side refusal fallback (`"fallbacks": "default"`):
+# a declined request is re-run on another model, routed by refusal category.
+_REFUSAL_FALLBACK_BETA = "server-side-fallback-2026-07-01"
 
 
 class AnthropicAdapter:
     """Adapter to call Anthropic Messages API and return OpenAI-compatible response."""
 
-    def __init__(self, base_url: str, api_key: str, timeout_sec: int = 300):
+    def __init__(
+        self,
+        base_url: str,
+        api_key: str,
+        timeout_sec: int = 300,
+        thinking: str = "",
+        effort: str = "",
+        refusal_fallback: bool = False,
+    ):
         if not HAS_HTTPX:
             raise ImportError(
                 "httpx is required for Anthropic adapter. Install: pip install httpx"
@@ -39,6 +56,11 @@ class AnthropicAdapter:
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.timeout_sec = timeout_sec
+        # Optional request settings (empty/False = not sent): thinking type
+        # (e.g. "adaptive"), output_config.effort and the refusal fallback.
+        self.thinking = thinking
+        self.effort = effort
+        self.refusal_fallback = refusal_fallback
         self._client: httpx.Client | None = None
 
     def close(self) -> None:
@@ -123,6 +145,17 @@ class AnthropicAdapter:
         }
         if system_msg:
             body["system"] = system_msg
+        if self.thinking or self.effort:
+            # Current models (e.g. claude-sonnet-5-5) reject non-default
+            # sampling values; leave temperature out entirely.
+            body.pop("temperature")
+            body["max_tokens"] = max(max_tokens, _THINKING_MIN_MAX_TOKENS)
+            if self.thinking:
+                body["thinking"] = {"type": self.thinking}
+            if self.effort:
+                body["output_config"] = {"effort": self.effort}
+        if self.refusal_fallback:
+            body["fallbacks"] = "default"
 
         url = f"{self.base_url}/v1/messages"
         headers = {
@@ -130,6 +163,8 @@ class AnthropicAdapter:
             "anthropic-version": "2023-06-01",
             "content-type": "application/json",
         }
+        if self.refusal_fallback:
+            headers["anthropic-beta"] = _REFUSAL_FALLBACK_BETA
 
         try:
             if self._client is None:

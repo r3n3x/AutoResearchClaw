@@ -642,28 +642,34 @@ def execute_stage(
             llm = create_llm_client(config)
         else:
             candidate = LLMClient.from_rc_config(config)
-            _codegen_model = str(getattr(config.llm, "codegen_model", "") or "").strip()
-            if (
-                stage == Stage.CODE_GENERATION
-                and _codegen_model
-                and _codegen_model != config.llm.primary_model
-            ):
+            if stage == Stage.CODE_GENERATION:
                 # Stage 10 codegen model override: codegen is the hardest
-                # prompt in the pipeline; route it to a stronger model while
-                # every other stage keeps the cheaper primary.
-                import dataclasses as _dc
-
-                candidate = LLMClient.from_rc_config(
-                    _dc.replace(
-                        config,
-                        llm=_dc.replace(config.llm, primary_model=_codegen_model),
+                # prompt in the pipeline; route it to a stronger model (on
+                # its own provider if codegen_provider is set) while every
+                # other stage keeps the cheaper primary.
+                _codegen = LLMClient.codegen_from_rc_config(config)
+                if (
+                    _codegen is not None
+                    and _codegen.config.base_url
+                    and _codegen.config.api_key
+                ):
+                    candidate = _codegen
+                    logger.info(
+                        "Stage 10 codegen model override: %s via %s (primary %s)",
+                        _codegen.config.primary_model,
+                        getattr(config.llm, "codegen_provider", "")
+                        or config.llm.provider,
+                        config.llm.primary_model,
                     )
-                )
-                logger.info(
-                    "Stage 10 codegen model override: %s (primary %s)",
-                    _codegen_model,
-                    config.llm.primary_model,
-                )
+                elif _codegen is not None:
+                    # A key-less client would make this stage fall back to a
+                    # placeholder experiment; keep the primary instead.
+                    logger.warning(
+                        "Stage 10 codegen model %s has no base_url/api key "
+                        "(check codegen_api_key_file/_env); using primary %s",
+                        _codegen.config.primary_model,
+                        config.llm.primary_model,
+                    )
             if candidate.config.base_url and candidate.config.api_key:
                 llm = candidate
     except Exception as _llm_exc:  # noqa: BLE001

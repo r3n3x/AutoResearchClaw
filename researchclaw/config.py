@@ -205,6 +205,20 @@ class LlmConfig:
     # in the pipeline (must implement the topic's core mechanism) and caps
     # out weaker models. Empty = use primary_model (backward-compatible).
     codegen_model: str = ""
+    # Optional independent provider for codegen_model (same pattern as the
+    # reviewer_* fields), e.g. codegen on Anthropic while every other stage
+    # stays on the main provider. Empty codegen_provider = reuse the main
+    # provider/base_url/key. codegen_api_key_file reads the key from a file
+    # at client creation, so it never sits in config or the environment.
+    codegen_provider: str = ""
+    codegen_base_url: str = ""
+    codegen_api_key_env: str = ""
+    codegen_api_key_file: str = ""
+    # Anthropic adapter only: thinking type ("adaptive"), effort
+    # ("low".."max") and the server-side refusal fallback for codegen_model.
+    codegen_thinking: str = ""
+    codegen_effort: str = ""
+    codegen_refusal_fallback: bool = False
     s2_api_key: str = ""
     notes: str = ""
     timeout_sec: int = 600
@@ -1194,6 +1208,13 @@ def _parse_llm_config(data: dict[str, Any]) -> LlmConfig:
         primary_model=data.get("primary_model", ""),
         fallback_models=tuple(data.get("fallback_models") or ()),
         codegen_model=data.get("codegen_model", ""),
+        codegen_provider=data.get("codegen_provider", ""),
+        codegen_base_url=data.get("codegen_base_url", ""),
+        codegen_api_key_env=data.get("codegen_api_key_env", ""),
+        codegen_api_key_file=data.get("codegen_api_key_file", ""),
+        codegen_thinking=data.get("codegen_thinking", ""),
+        codegen_effort=data.get("codegen_effort", ""),
+        codegen_refusal_fallback=bool(data.get("codegen_refusal_fallback", False)),
         s2_api_key=data.get("s2_api_key", ""),
         notes=data.get("notes", ""),
         timeout_sec=_safe_int(data.get("timeout_sec"), 600),
