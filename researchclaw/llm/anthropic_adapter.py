@@ -28,9 +28,11 @@ _STOP_REASON_MAP = {
     "refusal": "content_filter",
 }
 
-# Thinking counts toward max_tokens; with thinking on, a budget sized for the
-# reply alone (512-4096 in some codegen calls) can end before any text.
-_THINKING_MIN_MAX_TOKENS = 16000
+# Thinking counts toward max_tokens and the model does not see the cap: at
+# effort "high" a codegen prompt thought through all of a 16000 budget and
+# returned no text (31 Oct 2026). Such calls are streamed (see
+# _stream_messages), so the larger budget cannot hit the HTTP read timeout.
+_THINKING_MIN_MAX_TOKENS = 64000
 
 # Beta header for the server-side refusal fallback (`"fallbacks": "default"`):
 # a declined request is re-run on another model, routed by refusal category.
@@ -71,6 +73,62 @@ class AnthropicAdapter:
             except Exception:  # noqa: BLE001
                 pass
             self._client = None
+
+    def _stream_messages(
+        self, url: str, headers: dict[str, str], body: dict[str, Any]
+    ) -> dict[str, Any]:
+        """POST a ``stream: true`` request and fold the SSE events into the
+        shape of a non-streaming Messages API response (text blocks only,
+        stop_reason, usage, model). Thinking deltas are not kept.
+
+        HTTP errors surface as httpx.HTTPStatusError (body read first, so the
+        caller can quote it); an ``error`` event mid-stream raises
+        urllib.error.HTTPError (529 when overloaded) for the retry logic.
+        """
+        assert self._client is not None
+        texts: dict[int, list[str]] = {}
+        data: dict[str, Any] = {"model": body.get("model"), "usage": {}}
+        with self._client.stream("POST", url, headers=headers, json=body) as response:
+            if response.status_code >= 400:
+                response.read()
+                response.raise_for_status()
+            for line in response.iter_lines():
+                if not line.startswith("data:"):
+                    continue
+                try:
+                    event = json.loads(line[5:].strip())
+                except ValueError:
+                    continue
+                etype = event.get("type")
+                if etype == "message_start":
+                    message = event.get("message", {})
+                    data["model"] = message.get("model", data["model"])
+                    data["usage"].update(message.get("usage", {}))
+                elif etype == "content_block_delta":
+                    delta = event.get("delta", {})
+                    if delta.get("type") == "text_delta":
+                        texts.setdefault(event.get("index", 0), []).append(
+                            delta.get("text", "")
+                        )
+                elif etype == "message_delta":
+                    stop_reason = event.get("delta", {}).get("stop_reason")
+                    if stop_reason:
+                        data["stop_reason"] = stop_reason
+                    data["usage"].update(event.get("usage", {}))
+                elif etype == "error":
+                    error_info = event.get("error", {})
+                    raise urllib.error.HTTPError(
+                        url,
+                        529 if error_info.get("type") == "overloaded_error" else 500,
+                        f"{error_info.get('type', 'api_error')}: {error_info.get('message', '')}",
+                        {},
+                        None,
+                    )
+        data["content"] = [
+            {"type": "text", "text": "".join(parts)}
+            for _, parts in sorted(texts.items())
+        ]
+        return data
 
     def chat_completion(
         self,
@@ -150,6 +208,7 @@ class AnthropicAdapter:
             # sampling values; leave temperature out entirely.
             body.pop("temperature")
             body["max_tokens"] = max(max_tokens, _THINKING_MIN_MAX_TOKENS)
+            body["stream"] = True
             if self.thinking:
                 body["thinking"] = {"type": self.thinking}
             if self.effort:
@@ -169,9 +228,12 @@ class AnthropicAdapter:
         try:
             if self._client is None:
                 self._client = httpx.Client(timeout=self.timeout_sec)
-            response = self._client.post(url, headers=headers, json=body)
-            response.raise_for_status()
-            data = response.json()
+            if body.get("stream"):
+                data = self._stream_messages(url, headers, body)
+            else:
+                response = self._client.post(url, headers=headers, json=body)
+                response.raise_for_status()
+                data = response.json()
         except httpx.HTTPStatusError as exc:
             # Convert to urllib.error.HTTPError for upstream retry logic.
             # Include Anthropic's error body so upstream logs show the
@@ -218,6 +280,13 @@ class AnthropicAdapter:
         # Map Anthropic stop_reason to OpenAI finish_reason
         raw_stop_reason = data.get("stop_reason", "end_turn")
         finish_reason = _STOP_REASON_MAP.get(raw_stop_reason, "stop")
+        if raw_stop_reason == "max_tokens" and not content.strip():
+            logger.warning(
+                "%s stopped at max_tokens=%s with no text: thinking used the "
+                "whole budget.",
+                model,
+                body["max_tokens"],
+            )
 
         return {
             "choices": [
