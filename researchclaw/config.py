@@ -201,6 +201,10 @@ class LlmConfig:
     api_key: str = ""
     primary_model: str = ""
     fallback_models: tuple[str, ...] = ()
+    # Stage-10 code generation model override: codegen is the hardest prompt
+    # in the pipeline (must implement the topic's core mechanism) and caps
+    # out weaker models. Empty = use primary_model (backward-compatible).
+    codegen_model: str = ""
     s2_api_key: str = ""
     notes: str = ""
     timeout_sec: int = 600
@@ -1189,6 +1193,7 @@ def _parse_llm_config(data: dict[str, Any]) -> LlmConfig:
         api_key=data.get("api_key", ""),
         primary_model=data.get("primary_model", ""),
         fallback_models=tuple(data.get("fallback_models") or ()),
+        codegen_model=data.get("codegen_model", ""),
         s2_api_key=data.get("s2_api_key", ""),
         notes=data.get("notes", ""),
         timeout_sec=_safe_int(data.get("timeout_sec"), 600),

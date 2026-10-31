@@ -642,6 +642,28 @@ def execute_stage(
             llm = create_llm_client(config)
         else:
             candidate = LLMClient.from_rc_config(config)
+            _codegen_model = str(getattr(config.llm, "codegen_model", "") or "").strip()
+            if (
+                stage == Stage.CODE_GENERATION
+                and _codegen_model
+                and _codegen_model != config.llm.primary_model
+            ):
+                # Stage 10 codegen model override: codegen is the hardest
+                # prompt in the pipeline; route it to a stronger model while
+                # every other stage keeps the cheaper primary.
+                import dataclasses as _dc
+
+                candidate = LLMClient.from_rc_config(
+                    _dc.replace(
+                        config,
+                        llm=_dc.replace(config.llm, primary_model=_codegen_model),
+                    )
+                )
+                logger.info(
+                    "Stage 10 codegen model override: %s (primary %s)",
+                    _codegen_model,
+                    config.llm.primary_model,
+                )
             if candidate.config.base_url and candidate.config.api_key:
                 llm = candidate
     except Exception as _llm_exc:  # noqa: BLE001

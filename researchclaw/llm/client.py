@@ -80,6 +80,11 @@ class LLMConfig:
     max_tokens: int = 4096
     temperature: float = 0.7
     max_retries: int = 3
+    # Transient 5xx (proxy/provider crash mid-request) gets a deeper attempt
+    # budget than ordinary failures: a local proxy hiccup can outlast the
+    # shallow default and previously killed whole runs (rerun 6 died on
+    # repeated HTTP 500 from the local Morpheus proxy).
+    max_5xx_retries: int = 6
     retry_base_delay: float = 2.0
     timeout_sec: int = 300
     user_agent: str = _DEFAULT_USER_AGENT
@@ -355,7 +360,8 @@ class LLMClient:
     ) -> LLMResponse:
         """Call with exponential backoff retry."""
         last_exc: Exception | None = None
-        for attempt in range(self.config.max_retries):
+        max_attempts = max(self.config.max_retries, self.config.max_5xx_retries)
+        for attempt in range(max_attempts):
             is_last_attempt = attempt >= self.config.max_retries - 1
             try:
                 return self._raw_call(
@@ -393,11 +399,17 @@ class LLMClient:
                     if not _transient_400:
                         raise  # Genuine bad request — don't retry
 
-                # Retryable: 429 (rate limit), transient 400, 500, 502, 503, 504,
-                # 529 (Anthropic overloaded)
+                # Retryable: 429 (rate limit), transient 400, 500, 502, 503,
+                # 504, 529 (Anthropic overloaded). Transient 5xx uses the
+                # deeper max_5xx_retries budget; 429/400 stay on max_retries.
                 if status in (400, 429, 500, 502, 503, 504, 529):
                     last_exc = e
-                    if is_last_attempt:
+                    _limit = (
+                        self.config.max_5xx_retries
+                        if status in (500, 502, 503, 504, 529)
+                        else self.config.max_retries
+                    )
+                    if attempt >= _limit - 1:
                         raise
                     delay = min(
                         self.config.retry_base_delay * (2**attempt),
@@ -410,7 +422,7 @@ class LLMClient:
                     logger.info(
                         "Retry %d/%d for %s (HTTP %d). Waiting %.1fs.",
                         attempt + 1,
-                        self.config.max_retries,
+                        _limit,
                         model,
                         status,
                         delay,
