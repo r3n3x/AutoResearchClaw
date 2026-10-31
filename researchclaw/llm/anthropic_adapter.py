@@ -281,12 +281,51 @@ class AnthropicAdapter:
         raw_stop_reason = data.get("stop_reason", "end_turn")
         finish_reason = _STOP_REASON_MAP.get(raw_stop_reason, "stop")
         if raw_stop_reason == "max_tokens" and not content.strip():
-            logger.warning(
-                "%s stopped at max_tokens=%s with no text: thinking used the "
-                "whole budget.",
-                model,
-                body["max_tokens"],
-            )
+            # Extended thinking consumed the whole budget before any text
+            # block started (verified 31 Oct: 16k budget -> 15,999 thinking
+            # tokens, 0 text chars; 64k budget -> 23k thinking + full
+            # blueprint text). Retry once with a doubled budget so codegen
+            # does not silently receive an empty response.
+            retry_budget = min(body["max_tokens"] * 2, 128000)
+            if retry_budget > body["max_tokens"]:
+                logger.warning(
+                    "%s stopped at max_tokens=%d with no text (thinking "
+                    "consumed the budget). Retrying once with max_tokens=%d.",
+                    model,
+                    body["max_tokens"],
+                    retry_budget,
+                )
+                body["max_tokens"] = retry_budget
+                try:
+                    if body.get("stream"):
+                        data = self._stream_messages(url, headers, body)
+                    else:
+                        response = self._client.post(url, headers=headers, json=body)
+                        response.raise_for_status()
+                        data = response.json()
+                    if data.get("type") == "error" or "error" in data:
+                        raise urllib.error.HTTPError(
+                            url, 500,
+                            f"{data.get('error', {}).get('type', 'api_error')}: "
+                            f"{data.get('error', {}).get('message', str(data))}",
+                            {}, None,
+                        )
+                    text_parts = [
+                        block.get("text", "")
+                        for block in data.get("content", [])
+                        if block.get("type") == "text"
+                    ]
+                    content = "\n".join(text_parts)
+                    raw_stop_reason = data.get("stop_reason", "end_turn")
+                    finish_reason = _STOP_REASON_MAP.get(raw_stop_reason, "stop")
+                    logger.warning(
+                        "Retry with max_tokens=%d produced %d text chars "
+                        "(stop=%s).",
+                        retry_budget, len(content), raw_stop_reason,
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.exception("Thinking-budget retry failed")
+                    raise
 
         return {
             "choices": [

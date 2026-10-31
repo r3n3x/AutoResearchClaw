@@ -254,7 +254,46 @@ def test_adapter_stream_error_event_raises_retryable_http_error() -> None:
     assert exc.value.code == 529
 
 
-def test_adapter_empty_text_at_max_tokens_warns(caplog: pytest.LogCaptureFixture) -> None:
+def test_adapter_empty_text_at_max_tokens_retries_deeper(caplog: pytest.LogCaptureFixture) -> None:
+    """Empty text at max_tokens triggers one doubled-budget retry."""
+    adapter = AnthropicAdapter("https://api.anthropic.com", "k", thinking="adaptive", effort="high")
+    empty = _sse(
+        {"type": "message_start", "message": {"model": "claude-sonnet-5-5", "usage": {"input_tokens": 3}}},
+        {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": "x"}},
+        {"type": "message_delta", "delta": {"stop_reason": "max_tokens"}, "usage": {"output_tokens": 64000}},
+    )
+    ok = _sse(
+        {"type": "message_start", "message": {"model": "claude-sonnet-5-5", "usage": {"input_tokens": 3}}},
+        {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "```yaml\nfiles: []\n```"}},
+        {"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 20}},
+        {"type": "message_stop"},
+    )
+
+    stub = _StubClient()
+
+    def _stream_by_budget(method, url, headers, json):
+        lines = empty if json.get("max_tokens", 0) <= 64000 else ok
+        stub.calls.append({"url": url, "headers": headers, "json": json, "mode": "stream"})
+        return _StubStream(_StubResponse(lines))
+
+    stub.stream = _stream_by_budget  # type: ignore[method-assign]
+    adapter._client = stub  # type: ignore[assignment]
+    with caplog.at_level(logging.WARNING):
+        out = adapter.chat_completion(
+            "claude-sonnet-5-5",
+            [{"role": "system", "content": "s"}, {"role": "user", "content": "u"}],
+            max_tokens=8192,
+            temperature=0.7,
+        )
+    assert "```yaml" in out["choices"][0]["message"]["content"]
+    assert out["choices"][0]["finish_reason"] == "stop"
+    assert "Retrying once with max_tokens=128000" in caplog.text
+    # Second call must use the doubled budget.
+    assert stub.calls[1]["json"]["max_tokens"] == 128000
+
+
+def test_adapter_empty_text_retry_exhausted_keeps_empty(caplog: pytest.LogCaptureFixture) -> None:
+    """If even the doubled budget yields no text, return empty (caller handles)."""
     adapter = AnthropicAdapter("https://api.anthropic.com", "k", thinking="adaptive", effort="high")
     lines = _sse(
         {"type": "message_start", "message": {"model": "claude-sonnet-5-5", "usage": {"input_tokens": 3}}},
@@ -265,7 +304,7 @@ def test_adapter_empty_text_at_max_tokens_warns(caplog: pytest.LogCaptureFixture
         _, out = _call(adapter, stream_lines=lines)
     assert out["choices"][0]["message"]["content"] == ""
     assert out["choices"][0]["finish_reason"] == "length"
-    assert "thinking used the whole budget" in caplog.text
+    assert "produced 0 text chars" in caplog.text
 
 
 def test_adapter_defaults_unchanged() -> None:
